@@ -10,11 +10,8 @@ import io.cosmosoftware.kite.entities.VideoQuality;
 import io.cosmosoftware.kite.exception.KiteInteractionException;
 import io.cosmosoftware.kite.exception.KiteTestException;
 import io.cosmosoftware.kite.imgprocessing.ImageComparator;
-import io.cosmosoftware.kite.report.AllureStepReport;
 import io.cosmosoftware.kite.report.KiteLogger;
-import io.cosmosoftware.kite.report.Status;
-import io.cosmosoftware.kite.steps.StepPhase;
-import io.cosmosoftware.kite.steps.TestStep;
+
 import java.awt.image.BufferedImage;
 import java.awt.image.ColorModel;
 import java.awt.image.WritableRaster;
@@ -28,15 +25,17 @@ import org.openqa.selenium.*;
 import org.openqa.selenium.support.ui.ExpectedConditions;
 import org.openqa.selenium.support.ui.WebDriverWait;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import javax.json.*;
 import javax.json.stream.JsonGenerator;
 import java.io.*;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLConnection;
+import java.net.*;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.*;
 
@@ -44,7 +43,6 @@ import static io.cosmosoftware.kite.entities.Timeouts.ONE_SECOND_INTERVAL;
 import static io.cosmosoftware.kite.imgprocessing.ImageComparator.createImageFromBytes;
 import static io.cosmosoftware.kite.util.ReportUtils.getStackTrace;
 import static io.cosmosoftware.kite.util.ReportUtils.saveScreenshotPNG;
-import static io.cosmosoftware.kite.util.TestUtils.readJsonString;
 
 /**
  * The type Test utils.
@@ -258,12 +256,22 @@ public class TestUtils {
     CloseableHttpClient client = null;
     CloseableHttpResponse response = null;
     InputStream stream = null;
-    JsonReader reader = null;
+    int lastHttpReturnCode = 0;
+
+    JsonNode jsonObject = null;
+
+    //http://localhost:4444/wd/hub
+    URL tempURL = null;
+    try {
+      tempURL = new URL(hubUrl);
+    } catch (MalformedURLException e1) {
+      // TODO Auto-generated catch block
+      e1.printStackTrace();
+    }
+    String urlStr = tempURL.getProtocol() + "://" + tempURL.getAuthority();
+    logger.debug("urlStr: " + urlStr);
 
     try {
-      //http://localhost:4444/wd/hub
-      String urlStr = hubUrl.substring(0, hubUrl.indexOf("/wd/hub"));
-      logger.debug("urlStr: " + urlStr);
       client = HttpClients.createDefault();
       response =
           client.execute(
@@ -271,16 +279,13 @@ public class TestUtils {
                   urlStr
                       + "/grid/api/testsession?session="
                       + sessionId));
+      lastHttpReturnCode = response.getStatusLine().getStatusCode();
       stream = response.getEntity().getContent();
-      reader = Json.createReader(stream);
-      URL url = new URL(reader.readObject().getString("proxyId"));
-      node = String.format(protocolAuthorityFormat, url.getProtocol(), url.getAuthority());
+      ObjectMapper mapper = new ObjectMapper();
+      jsonObject = mapper.readTree(IOUtils.toString(stream, StandardCharsets.UTF_8));
     } catch (Exception e) {
       logger.error("Exception while talking to the grid", e);
     } finally {
-      if (reader != null) {
-        reader.close();
-      }
       if (stream != null) {
         try {
           stream.close();
@@ -306,6 +311,30 @@ public class TestUtils {
         }
       }
     }
+
+
+    // retry with selenium grid 4 API
+    logger.debug("lastHttpReturnCode: " + lastHttpReturnCode);
+    if (lastHttpReturnCode == 404) {
+      String selgrid4url = tempURL.getProtocol() + "://" + tempURL.getHost() + ":" + tempURL.getPort();
+      logger.debug("selgrid4url: " + selgrid4url);
+      jsonObject = SelGridClient.getSeleniumSessionInfo(tempURL.getProtocol() + "://" + tempURL.getHost(), sessionId, tempURL.getPort());
+    }
+
+    URL url = null;
+    try {
+      assert jsonObject != null;
+      logger.debug(jsonObject.asText("json object should not be null"));
+      String proxyId = jsonObject.findPath("data")
+              .findPath("session")
+              .findPath("nodeUri")
+              .asText();
+      url = new URL(proxyId);
+      node = String.format(protocolAuthorityFormat, url.getProtocol(), url.getAuthority());
+    } catch (MalformedURLException e) {
+      logger.error("Malformed URL", e);
+    }
+
 
     return node;
   }
@@ -734,59 +763,9 @@ public class TestUtils {
    * @return the private ip
    */
   public static String getPrivateIp(String hupIpOrDns, String sessionId, String... port) {
-
-    String privateIp = null;
     String usedPort = port.length > 0 ? port[0] : "4444";
-    CloseableHttpClient client = null;
-    CloseableHttpResponse response = null;
-    InputStream stream = null;
-    JsonReader reader = null;
 
-    try {
-      client = HttpClients.createDefault();
-      HttpGet httpGet =
-          new HttpGet("http://" + hupIpOrDns + ":"+ usedPort +"/grid/api/testsession?session=" + sessionId);
-      response = client.execute(httpGet);
-      stream = response.getEntity().getContent();
-      reader = Json.createReader(stream);
-      JsonObject object = reader.readObject();
-      String proxyId = object.getString("proxyId");
-      URL url = new URL(proxyId);
-      privateIp = url.getHost();
-    } catch (Exception e) {
-      logger.error("Exception while talking to the grid", e);
-    } finally {
-      if (reader != null) {
-        reader.close();
-      }
-      if (stream != null) {
-        try {
-          stream.close();
-        } catch (IOException e) {
-          logger.warn("Exception while closing the InputStream", e);
-        }
-      }
-      if (response != null) {
-        if (logger.isDebugEnabled()) {
-          logger.debug("response->" + response);
-        }
-        try {
-          response.close();
-        } catch (IOException e) {
-          logger.warn("Exception while closing the CloseableHttpResponse", e);
-        }
-      }
-      if (client != null) {
-        try {
-          client.close();
-        } catch (IOException e) {
-          logger.warn("Exception while closing the CloseableHttpClient", e);
-        }
-      }
-    }
-
-    return privateIp;
-
+    return getNode("http://" + hupIpOrDns + ":"+ usedPort, sessionId);
   }
 
   /**
